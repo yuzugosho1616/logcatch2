@@ -41,4 +41,15 @@ pip install -r requirements.txt
 python -m unittest -v
 ```
 
+## EXEの作成
+
+ビルド用依存パッケージをインストールし、スクリプトを実行します。
+
+```powershell
+pip install -r requirements-build.txt
+.\build_exe.ps1
+```
+
+単一ファイルのWindows GUIアプリとして `dist\LogCatch.exe` が生成されます。抽出結果の `results` フォルダーは、実行したEXEと同じフォルダーに作られます。
+
 従来のブラウザ版は `logcatch.html` として残しています。
