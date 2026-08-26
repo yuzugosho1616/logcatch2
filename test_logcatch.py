@@ -8,6 +8,7 @@ from logcatch import (
     PREVIEW_EVENT_LIMIT,
     SearchGroup,
     SearchOptions,
+    build_byte_prefilter,
     create_result_path,
     detect_encoding,
     extract_logs,
@@ -61,6 +62,9 @@ class LogCatchTests(unittest.TestCase):
             self.assertIn("ERROR 座村清市 timeout", result)
             self.assertIn(f"[===Close File :{cp932}==]", result)
             self.assertEqual(detect_encoding(cp932, "auto"), "cp932")
+            file_events = [payload for kind, payload in events if kind == "file"]
+            self.assertTrue(file_events)
+            self.assertTrue(all(payload["fast_path"] for payload in file_events))
         finally:
             utf8.unlink(missing_ok=True)
             cp932.unlink(missing_ok=True)
@@ -144,6 +148,61 @@ class LogCatchTests(unittest.TestCase):
             self.assertTrue(preview_sizes)
             self.assertLessEqual(max(preview_sizes), PREVIEW_EVENT_LIMIT)
             self.assertIn("MATCH 0", output.read_text(encoding="utf-8"))
+        finally:
+            source.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
+
+    def test_byte_prefilter_supports_cp932_japanese_and_ascii(self):
+        options = SearchOptions(
+            [SearchGroup(["座村清市", "error"], "and")],
+            "and",
+            False,
+            "auto",
+        )
+        prefilter = build_byte_prefilter(options, "cp932")
+        self.assertIsNotNone(prefilter)
+        self.assertTrue(prefilter("ERROR 座村清市".encode("cp932")))
+        self.assertFalse(prefilter("INFO 座村清市".encode("cp932")))
+
+    def test_unicode_casefold_condition_uses_compatible_fallback(self):
+        options = SearchOptions([SearchGroup(["ärger"], "and")], "and", False, "auto")
+        self.assertIsNone(build_byte_prefilter(options, "utf-8"))
+
+        token = uuid.uuid4().hex
+        source = Path(f".test_{token}_unicode.log")
+        output = Path(f".test_{token}_unicode_result.log")
+        events = []
+        try:
+            source.write_text("INFO\nÄRGER detected\n", encoding="utf-8")
+            extraction = extract_logs(
+                [source],
+                options,
+                output,
+                threading.Event(),
+                lambda kind, payload: events.append((kind, payload)),
+            )
+            self.assertEqual(extraction.matches, 1)
+            self.assertIn("ÄRGER detected", output.read_text(encoding="utf-8"))
+            file_event = next(payload for kind, payload in events if kind == "file")
+            self.assertFalse(file_event["fast_path"])
+        finally:
+            source.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
+
+    def test_fast_path_handles_line_across_detection_chunk(self):
+        token = uuid.uuid4().hex
+        source = Path(f".test_{token}_chunk_boundary.log")
+        output = Path(f".test_{token}_chunk_boundary_result.log")
+        try:
+            source.write_text("X" * (1024 * 1024 + 17) + " MATCH\n", encoding="utf-8")
+            extraction = extract_logs(
+                [source],
+                SearchOptions([SearchGroup(["MATCH"], "and")], "and", True, "auto"),
+                output,
+                threading.Event(),
+                lambda _kind, _payload: None,
+            )
+            self.assertEqual(extraction.matches, 1)
         finally:
             source.unlink(missing_ok=True)
             output.unlink(missing_ok=True)

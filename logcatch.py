@@ -106,7 +106,75 @@ class ExtractionResult:
     file_errors: int
 
 
+@dataclass(frozen=True)
+class ByteSearchPlan:
+    groups: list[tuple[list[bytes], str]]
+    group_mode: str
+    ignore_case: bool
+
+    def __call__(self, line: bytes) -> bool:
+        haystack = line.lower() if self.ignore_case else line
+
+        def group_matches(group: tuple[list[bytes], str]) -> bool:
+            terms, mode = group
+            checks = (term in haystack for term in terms)
+            return all(checks) if mode == "and" else any(checks)
+
+        results = (group_matches(group) for group in self.groups)
+        return all(results) if self.group_mode == "and" else any(results)
+
+
 EventCallback = Callable[[str, dict], None]
+
+
+def build_text_matcher(options: SearchOptions) -> Callable[[str], bool]:
+    groups = [
+        SearchGroup(
+            group.terms if options.case_sensitive else [term.casefold() for term in group.terms],
+            group.mode,
+        )
+        for group in options.groups
+    ]
+
+    def matches(line: str) -> bool:
+        haystack = line if options.case_sensitive else line.casefold()
+
+        def group_matches(group: SearchGroup) -> bool:
+            checks = (term in haystack for term in group.terms)
+            return all(checks) if group.mode == "and" else any(checks)
+
+        results = (group_matches(group) for group in groups)
+        return all(results) if options.group_mode == "and" else any(results)
+
+    return matches
+
+
+def supports_byte_casefold(term: str) -> bool:
+    return all(character.isascii() or character.lower() == character.upper() for character in term)
+
+
+def build_byte_prefilter(options: SearchOptions, encoding: str) -> ByteSearchPlan | None:
+    if not options.case_sensitive and not all(
+        supports_byte_casefold(term) for group in options.groups for term in group.terms
+    ):
+        return None
+
+    codec = "utf-8" if encoding == "utf-8-sig" else encoding
+    try:
+        groups = [
+            (
+                [
+                    (term if options.case_sensitive else term.casefold()).encode(codec, errors="strict")
+                    for term in group.terms
+                ],
+                group.mode,
+            )
+            for group in options.groups
+        ]
+    except UnicodeEncodeError:
+        return None
+
+    return ByteSearchPlan(groups, options.group_mode, not options.case_sensitive)
 
 
 def extract_logs(
@@ -127,23 +195,7 @@ def extract_logs(
     completed_bytes = 0
     match_count = 0
     file_errors = 0
-    groups = [
-        SearchGroup(
-            group.terms if options.case_sensitive else [term.casefold() for term in group.terms],
-            group.mode,
-        )
-        for group in options.groups
-    ]
-
-    def matches(line: str) -> bool:
-        haystack = line if options.case_sensitive else line.casefold()
-
-        def group_matches(group: SearchGroup) -> bool:
-            checks = (term in haystack for term in group.terms)
-            return all(checks) if group.mode == "and" else any(checks)
-
-        results = (group_matches(group) for group in groups)
-        return all(results) if options.group_mode == "and" else any(results)
+    matches = build_text_matcher(options)
 
     with output_path.open("w", encoding="utf-8", newline="\n", buffering=CHUNK_SIZE) as output:
         for index, path in enumerate(files):
@@ -159,47 +211,103 @@ def extract_logs(
             preview_batch: list[str] = []
             emit("marker", {"lines": [open_marker]})
             try:
-                with path.open("rb", buffering=0) as source:
+                with path.open("rb", buffering=CHUNK_SIZE) as source:
                     first_chunk = source.read(CHUNK_SIZE) if options.encoding == "auto" else None
                     encoding = detect_encoding_from_sample(first_chunk or b"", options.encoding)
-                    emit("file", {"index": index + 1, "count": len(files), "path": str(path), "encoding": encoding})
-                    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
-                    pending = ""
-                    last_update = 0.0
-                    while not cancel.is_set():
-                        if first_chunk is not None:
-                            chunk = first_chunk
-                            first_chunk = None
-                        else:
-                            chunk = source.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        file_read += len(chunk)
-                        text = pending + decoder.decode(chunk, final=False)
-                        lines = text.split("\n")
-                        pending = lines.pop()
-                        for line in lines:
-                            line = line.removesuffix("\r")
-                            if matches(line):
-                                output.write(line + "\n")
-                                match_count += 1
-                                preview_batch.append(line)
-                        now = time.monotonic()
-                        if preview_batch and (len(preview_batch) >= 200 or now - last_update >= 0.1):
-                            emit("preview", {"lines": preview_batch[-PREVIEW_EVENT_LIMIT:], "matches": match_count})
-                            preview_batch = []
-                        if now - last_update >= 0.1:
-                            emit("progress", {"done": completed_bytes + file_read, "total": total_bytes})
-                            last_update = now
+                    byte_prefilter = build_byte_prefilter(options, encoding)
+                    emit(
+                        "file",
+                        {
+                            "index": index + 1,
+                            "count": len(files),
+                            "path": str(path),
+                            "encoding": encoding,
+                            "fast_path": byte_prefilter is not None,
+                        },
+                    )
+                    if byte_prefilter is not None:
+                        source.seek(0)
+                        last_progress = 0
+                        byte_groups = byte_prefilter.groups
+                        single_group = byte_groups[0] if len(byte_groups) == 1 else None
+                        ignore_case = byte_prefilter.ignore_case
+                        for raw_line in source:
+                            file_read += len(raw_line)
+                            haystack = raw_line.lower() if ignore_case else raw_line
+                            if single_group is not None:
+                                terms, mode = single_group
+                                checks = (term in haystack for term in terms)
+                                is_candidate = all(checks) if mode == "and" else any(checks)
+                            else:
+                                group_results = []
+                                for terms, mode in byte_groups:
+                                    checks = (term in haystack for term in terms)
+                                    group_results.append(all(checks) if mode == "and" else any(checks))
+                                is_candidate = (
+                                    all(group_results)
+                                    if byte_prefilter.group_mode == "and"
+                                    else any(group_results)
+                                )
+                            if is_candidate:
+                                content = raw_line
+                                if content.endswith(b"\n"):
+                                    content = content[:-1]
+                                if content.endswith(b"\r"):
+                                    content = content[:-1]
+                                line = content.decode(encoding, errors="replace")
+                                if matches(line):
+                                    output.write(line + "\n")
+                                    match_count += 1
+                                    preview_batch.append(line)
+                                    if len(preview_batch) >= PREVIEW_EVENT_LIMIT:
+                                        emit("preview", {"lines": preview_batch, "matches": match_count})
+                                        preview_batch = []
+                            if file_read - last_progress >= CHUNK_SIZE:
+                                if cancel.is_set():
+                                    break
+                                if preview_batch:
+                                    emit("preview", {"lines": preview_batch, "matches": match_count})
+                                    preview_batch = []
+                                emit("progress", {"done": completed_bytes + file_read, "total": total_bytes})
+                                last_progress = file_read
+                    else:
+                        decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+                        pending = ""
+                        last_update = 0.0
+                        while not cancel.is_set():
+                            if first_chunk is not None:
+                                chunk = first_chunk
+                                first_chunk = None
+                            else:
+                                chunk = source.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            file_read += len(chunk)
+                            text = pending + decoder.decode(chunk, final=False)
+                            lines = text.split("\n")
+                            pending = lines.pop()
+                            for line in lines:
+                                line = line.removesuffix("\r")
+                                if matches(line):
+                                    output.write(line + "\n")
+                                    match_count += 1
+                                    preview_batch.append(line)
+                            now = time.monotonic()
+                            if preview_batch and (len(preview_batch) >= 200 or now - last_update >= 0.1):
+                                emit("preview", {"lines": preview_batch[-PREVIEW_EVENT_LIMIT:], "matches": match_count})
+                                preview_batch = []
+                            if now - last_update >= 0.1:
+                                emit("progress", {"done": completed_bytes + file_read, "total": total_bytes})
+                                last_update = now
 
-                    if not cancel.is_set():
-                        pending += decoder.decode(b"", final=True)
-                        if pending:
-                            pending = pending.removesuffix("\r")
-                            if matches(pending):
-                                output.write(pending + "\n")
-                                match_count += 1
-                                preview_batch.append(pending)
+                        if not cancel.is_set():
+                            pending += decoder.decode(b"", final=True)
+                            if pending:
+                                pending = pending.removesuffix("\r")
+                                if matches(pending):
+                                    output.write(pending + "\n")
+                                    match_count += 1
+                                    preview_batch.append(pending)
             except OSError as error:
                 file_errors += 1
                 had_file_error = True
@@ -616,7 +724,8 @@ class LogCatchApp:
                         self.count_label.configure(text=f"{self.match_count:,} 行")
                 elif kind == "file":
                     label = "Shift_JIS" if payload["encoding"] == "cp932" else payload["encoding"].upper()
-                    self.current_label.configure(text=f"{payload['index']} / {payload['count']}  {payload['path']}  [{label}]")
+                    speed = "・高速" if payload.get("fast_path") else ""
+                    self.current_label.configure(text=f"{payload['index']} / {payload['count']}  {payload['path']}  [{label}{speed}]")
                 elif kind == "progress":
                     total = payload["total"]
                     self.progress_var.set(payload["done"] / total * 100 if total else 0)
