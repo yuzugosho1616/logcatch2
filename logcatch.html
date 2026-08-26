@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LogCatch</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #66717e;
+      --line: #d8dee5;
+      --panel: #ffffff;
+      --canvas: #f4f6f8;
+      --accent: #176b5b;
+      --accent-strong: #0d5145;
+      --focus: #d7eee8;
+      --warning: #a24c18;
+      font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: var(--canvas); color: var(--ink); }
+    button, input, select { font: inherit; }
+    button { cursor: pointer; }
+
+    .app-header {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 28px;
+      color: white;
+      background: #202b36;
+      border-bottom: 4px solid var(--accent);
+    }
+    .mark { width: 28px; height: 28px; display: grid; gap: 3px; }
+    .mark span { display: block; height: 4px; background: #73c8b7; border-radius: 2px; }
+    .mark span:nth-child(2) { width: 72%; }
+    .mark span:nth-child(3) { width: 88%; }
+    h1 { margin: 0; font-size: 20px; letter-spacing: 0; }
+    .tagline { color: #bac5cf; font-size: 13px; }
+
+    main { width: min(1180px, calc(100% - 32px)); margin: 24px auto 36px; }
+    .section { padding: 20px 0; border-bottom: 1px solid var(--line); }
+    .section:first-child { padding-top: 0; }
+    .section-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .section-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 12px; }
+    h2 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0; }
+    .hint, .meta { color: var(--muted); font-size: 12px; }
+
+    .drop-zone {
+      height: 154px;
+      overflow: auto;
+      padding: 5px 7px;
+      background: var(--panel);
+      border: 1px solid #8995a0;
+      border-radius: 2px;
+      transition: border-color .15s, background .15s;
+    }
+    .drop-zone.drag { outline: 3px solid var(--focus); border-color: var(--accent); background: #edf8f5; }
+    .empty-drop { height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 6px; color: var(--muted); }
+    .empty-drop[hidden] { display: none; }
+    .empty-drop strong { color: var(--ink); font-size: 14px; }
+    .empty-drop svg { color: var(--accent); }
+    input[type=file] { display: none; }
+    .link-button { padding: 0; color: var(--accent); background: none; border: 0; text-decoration: underline; font-size: 12px; }
+
+    .file-list { min-width: max-content; font: 12px/1.45 Consolas, "BIZ UDゴシック", monospace; }
+    .file-row { white-space: nowrap; }
+    .file-row:nth-child(even) { background: #f5f7f8; }
+
+    .search-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+    .word-input { min-width: 0; height: 42px; padding: 0 12px; border: 1px solid #aeb8c2; border-radius: 4px; background: white; }
+    .word-input:focus { outline: 3px solid var(--focus); border-color: var(--accent); }
+    .primary, .secondary { height: 42px; padding: 0 18px; border-radius: 4px; font-weight: 700; }
+    .primary { color: white; background: var(--accent); border: 1px solid var(--accent); }
+    .primary:hover { background: var(--accent-strong); }
+    .secondary { color: var(--ink); background: white; border: 1px solid #9da8b3; }
+    button:disabled { cursor: not-allowed; opacity: .48; }
+
+    .options { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-top: 12px; }
+    .segmented { display: inline-grid; grid-template-columns: 1fr 1fr; border: 1px solid #9da8b3; border-radius: 4px; overflow: hidden; }
+    .segmented label { position: relative; min-width: 72px; padding: 8px 14px; text-align: center; font-size: 13px; cursor: pointer; }
+    .segmented label + label { border-left: 1px solid #9da8b3; }
+    .segmented input { position: absolute; opacity: 0; }
+    .segmented label:has(input:checked) { color: white; background: #34495a; }
+    .check { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+    .check input { width: 17px; height: 17px; accent-color: var(--accent); }
+    .encoding { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+    .encoding select { height: 34px; padding: 0 28px 0 9px; color: var(--ink); background: white; border: 1px solid #9da8b3; border-radius: 4px; }
+
+    .progress-shell { height: 10px; overflow: hidden; background: #dfe4e8; border-radius: 3px; }
+    .progress-bar { width: 0; height: 100%; background: var(--accent); transition: width .1s linear; }
+    .progress-info { display: flex; justify-content: space-between; gap: 16px; margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .actions { display: flex; gap: 8px; margin-top: 14px; }
+
+    .result-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .result-tools { display: flex; align-items: center; gap: 10px; }
+    .result-count { font-variant-numeric: tabular-nums; color: var(--accent-strong); font-weight: 700; }
+    .copy-button { height: 32px; padding: 0 11px; color: var(--ink); background: white; border: 1px solid #9da8b3; border-radius: 4px; font-size: 12px; font-weight: 700; }
+    .copy-button:hover:not(:disabled) { background: #edf0f3; }
+    .log-view { height: min(48vh, 480px); overflow: auto; margin: 0; padding: 14px; color: #d9e1e8; background: #151b21; border: 1px solid #0b1014; border-radius: 4px; font: 12px/1.6 Consolas, "BIZ UDゴシック", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .empty { color: #84919c; }
+    .notice { color: var(--warning); }
+
+    @media (max-width: 620px) {
+      .app-header { padding: 0 16px; }
+      .tagline { display: none; }
+      main { width: calc(100% - 24px); margin-top: 16px; }
+      .search-row { grid-template-columns: 1fr; }
+      .primary { width: 100%; }
+      .progress-info { flex-direction: column; gap: 3px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <div class="mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <h1>LogCatch</h1>
+    <span class="tagline">Large log line extractor</span>
+  </header>
+
+  <main>
+    <section class="section">
+      <div class="section-title"><h2>1. ログファイル</h2><div class="section-tools"><span class="meta" id="fileSummary">未選択</span><button class="link-button" id="browseButton" type="button">ファイルを追加</button><button class="link-button" id="clearFilesButton" type="button" disabled>すべてクリア</button></div></div>
+      <div class="drop-zone" id="dropZone" tabindex="0" role="button" aria-label="ログファイルを選択">
+        <div class="empty-drop" id="emptyDrop">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 3v12m0-12 4 4m-4-4L8 7M5 14v5h14v-5"/></svg>
+          <strong>.logファイルをここへドロップ</strong>
+        </div>
+        <div class="file-list" id="fileList"></div>
+        <input id="fileInput" type="file" accept=".log,text/plain" multiple>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-title"><h2>2. 検索ワード</h2><span class="hint">改行またはカンマで複数指定</span></div>
+      <div class="search-row">
+        <input class="word-input" id="words" type="text" placeholder="例: ERROR, timeout, user_id" autocomplete="off">
+        <button class="primary" id="startButton" type="button" disabled>抽出を開始</button>
+      </div>
+      <div class="options">
+        <div class="segmented" aria-label="検索方法">
+          <label><input type="radio" name="mode" value="and" checked>AND</label>
+          <label><input type="radio" name="mode" value="or">OR</label>
+        </div>
+        <label class="check"><input id="caseSensitive" type="checkbox">大文字・小文字を区別</label>
+        <label class="check"><input id="autoScroll" type="checkbox" checked>結果を自動スクロール</label>
+        <label class="encoding">文字コード
+          <select id="encoding">
+            <option value="auto" selected>自動判定</option>
+            <option value="utf-8">UTF-8</option>
+            <option value="shift_jis">Shift_JIS</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-title"><h2>3. 抽出状況</h2><span class="meta" id="status">待機中</span></div>
+      <div class="progress-shell" role="progressbar" aria-label="抽出進捗" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="progress-info"><span id="currentFile">ファイルを選択してください</span><span id="progressNumbers">0 B / 0 B</span></div>
+      <div class="actions">
+        <button class="secondary" id="saveButton" type="button">出力先を指定</button>
+        <button class="secondary" id="cancelButton" type="button" disabled>中止</button>
+      </div>
+      <p class="hint" id="saveHint">出力先を指定すると、抽出行をメモリに溜めず逐次保存します。</p>
+    </section>
+
+    <section class="section">
+      <div class="result-head"><h2>4. 抽出結果</h2><div class="result-tools"><span class="result-count" id="resultCount">0 行</span><button class="copy-button" id="copyButton" type="button" disabled>結果をコピー</button></div></div>
+      <pre class="log-view" id="logView"><span class="empty">抽出を開始すると、ここに一致した行が表示されます。</span></pre>
+      <p class="hint">画面にはパフォーマンス維持のため最新5,000行を表示します。</p>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { files: [], running: false, cancelled: false, outputHandle: null, writer: null, matches: 0, visible: [] };
+    const ui = {
+      drop: $('dropZone'), input: $('fileInput'), list: $('fileList'), summary: $('fileSummary'), words: $('words'),
+      start: $('startButton'), cancel: $('cancelButton'), save: $('saveButton'), saveHint: $('saveHint'), status: $('status'),
+      current: $('currentFile'), numbers: $('progressNumbers'), bar: $('progressBar'), view: $('logView'), count: $('resultCount')
+    };
+
+    function formatBytes(bytes) {
+      if (!bytes) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+      return `${(bytes / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`;
+    }
+
+    function setFiles(newFiles) {
+      const valid = [...newFiles].filter(file => file.name.toLowerCase().endsWith('.log'));
+      for (const file of valid) {
+        if (!state.files.some(f => f.name === file.name && f.size === file.size && f.lastModified === file.lastModified)) state.files.push(file);
+      }
+      renderFiles();
+    }
+
+    function renderFiles() {
+      ui.list.replaceChildren();
+      state.files.forEach((file, index) => {
+        const row = document.createElement('div'); row.className = 'file-row';
+        row.textContent = displayPath(file); row.title = `${displayPath(file)} (${formatBytes(file.size)})`;
+        ui.list.append(row);
+      });
+      $('emptyDrop').hidden = state.files.length > 0;
+      const total = state.files.reduce((sum, file) => sum + file.size, 0);
+      ui.summary.textContent = state.files.length ? `${state.files.length}ファイル・${formatBytes(total)}` : '未選択';
+      $('clearFilesButton').disabled = state.running || !state.files.length;
+      updateStartState();
+    }
+
+    function getWords() { return ui.words.value.split(/[\n,]/).map(v => v.trim()).filter(Boolean); }
+    function updateStartState() { ui.start.disabled = state.running || !state.files.length || !getWords().length; }
+    function setProgress(done, total) {
+      const percent = total ? Math.min(100, done / total * 100) : 0;
+      ui.bar.style.width = `${percent}%`;
+      ui.bar.parentElement.setAttribute('aria-valuenow', String(Math.round(percent)));
+      ui.numbers.textContent = `${formatBytes(done)} / ${formatBytes(total)} (${percent.toFixed(1)}%)`;
+    }
+
+    function addDisplayLines(lines) {
+      if (!lines.length) return;
+      state.visible.push(...lines);
+      if (state.visible.length > 5000) state.visible.splice(0, state.visible.length - 5000);
+      ui.view.textContent = state.visible.join('\n');
+      $('copyButton').disabled = false;
+      if ($('autoScroll').checked) ui.view.scrollTop = ui.view.scrollHeight;
+    }
+
+    function addMatches(lines) {
+      if (!lines.length) return;
+      state.matches += lines.length;
+      addDisplayLines(lines);
+      ui.count.textContent = `${state.matches.toLocaleString()} 行`;
+    }
+
+    function displayPath(file) {
+      return file.webkitRelativePath || file.name;
+    }
+
+    async function writeFileMarker(file, type, leadingBlank = false) {
+      const marker = `${leadingBlank ? '\n' : ''}[===${type} File :${displayPath(file)}==]`;
+      if (state.writer) await state.writer.write(marker + '\n');
+      addDisplayLines([marker]);
+    }
+
+    async function chooseOutput() {
+      if (!window.showSaveFilePicker) {
+        ui.saveHint.textContent = 'このブラウザは逐次保存に未対応です。最新版のChromeまたはEdgeをご利用ください。';
+        return;
+      }
+      try {
+        state.outputHandle = await showSaveFilePicker({ suggestedName: `extracted_${new Date().toISOString().slice(0, 10)}.log`, types: [{ description: 'Log file', accept: { 'text/plain': ['.log'] } }] });
+        ui.saveHint.textContent = `出力先: ${state.outputHandle.name}`;
+        ui.save.textContent = '出力先を変更';
+      } catch (error) { if (error.name !== 'AbortError') ui.saveHint.textContent = `出力先を選択できませんでした: ${error.message}`; }
+    }
+
+    async function copyResults() {
+      const button = $('copyButton');
+      const text = state.visible.join('\n');
+      if (!text) return;
+      try {
+        let copied = false;
+        if (navigator.clipboard?.writeText) {
+          try { await navigator.clipboard.writeText(text); copied = true; } catch { /* Try the local-file fallback below. */ }
+        }
+        if (!copied) {
+          const area = document.createElement('textarea');
+          area.value = text; area.style.position = 'fixed'; area.style.opacity = '0';
+          document.body.append(area); area.select();
+          copied = document.execCommand('copy');
+          area.remove();
+          if (!copied) throw new Error('copy failed');
+        }
+        button.textContent = 'コピーしました';
+      } catch {
+        button.textContent = 'コピーできませんでした';
+      }
+      setTimeout(() => { button.textContent = '結果をコピー'; }, 1800);
+    }
+
+    async function detectEncoding(file) {
+      const selected = $('encoding').value;
+      if (selected !== 'auto') return selected;
+      const sample = await file.slice(0, Math.min(file.size, 1024 * 1024)).arrayBuffer();
+      try {
+        new TextDecoder('utf-8', { fatal: true }).decode(sample);
+        return 'utf-8';
+      } catch {
+        return 'shift_jis';
+      }
+    }
+
+    async function processFile(file, matcher, baseDone, totalBytes) {
+      const reader = file.stream().getReader();
+      const encoding = await detectEncoding(file);
+      const decoder = new TextDecoder(encoding);
+      ui.current.textContent += `  [${encoding === 'shift_jis' ? 'Shift_JIS' : 'UTF-8'}]`;
+      let pending = '', read = 0, batch = [], lastPaint = 0;
+      while (!state.cancelled) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        read += value.byteLength;
+        const text = pending + decoder.decode(value, { stream: true });
+        const lines = text.split(/\r?\n/); pending = lines.pop() ?? '';
+        for (const line of lines) if (matcher(line)) batch.push(line);
+        if (batch.length >= 200 || performance.now() - lastPaint > 100) {
+          if (state.writer && batch.length) await state.writer.write(batch.join('\n') + '\n');
+          addMatches(batch); batch = []; lastPaint = performance.now();
+          setProgress(baseDone + read, totalBytes);
+          await new Promise(requestAnimationFrame);
+        }
+      }
+      pending += decoder.decode();
+      if (!state.cancelled && pending && matcher(pending)) batch.push(pending);
+      if (state.writer && batch.length) await state.writer.write(batch.join('\n') + '\n');
+      addMatches(batch);
+      setProgress(baseDone + read, totalBytes);
+      if (state.cancelled) await reader.cancel();
+    }
+
+    async function start() {
+      const words = getWords(); if (!state.files.length || !words.length) return;
+      state.running = true; state.cancelled = false; state.matches = 0; state.visible = [];
+      ui.view.textContent = ''; ui.count.textContent = '0 行'; $('copyButton').disabled = true; ui.cancel.disabled = false; ui.save.disabled = true;
+      updateStartState();
+      const caseSensitive = $('caseSensitive').checked;
+      const needles = caseSensitive ? words : words.map(w => w.toLocaleLowerCase());
+      const mode = document.querySelector('input[name=mode]:checked').value;
+      const matcher = line => { const haystack = caseSensitive ? line : line.toLocaleLowerCase(); return mode === 'and' ? needles.every(w => haystack.includes(w)) : needles.some(w => haystack.includes(w)); };
+      const total = state.files.reduce((sum, file) => sum + file.size, 0);
+      let done = 0;
+      try {
+        if (state.outputHandle) state.writer = await state.outputHandle.createWritable();
+        for (let i = 0; i < state.files.length && !state.cancelled; i++) {
+          const file = state.files[i]; ui.current.textContent = `${i + 1} / ${state.files.length}  ${file.name}`; ui.status.textContent = '抽出中';
+          await writeFileMarker(file, 'Open', i > 0);
+          await processFile(file, matcher, done, total); done += file.size;
+          await writeFileMarker(file, 'Close');
+        }
+        if (state.writer) await state.writer.close();
+        ui.status.textContent = state.cancelled ? '中止しました' : '完了';
+        ui.current.textContent = state.cancelled ? '処理を中止しました' : `${state.files.length}ファイルの処理が完了しました`;
+        if (!state.cancelled) setProgress(total, total);
+      } catch (error) {
+        if (state.writer) await state.writer.abort().catch(() => {});
+        ui.status.textContent = 'エラー'; ui.current.textContent = error.message;
+      } finally {
+        state.writer = null; state.running = false; ui.cancel.disabled = true; ui.save.disabled = false; renderFiles(); updateStartState();
+      }
+    }
+
+    ['dragenter', 'dragover'].forEach(type => ui.drop.addEventListener(type, event => { event.preventDefault(); ui.drop.classList.add('drag'); }));
+    ['dragleave', 'drop'].forEach(type => ui.drop.addEventListener(type, event => { event.preventDefault(); ui.drop.classList.remove('drag'); }));
+    ui.drop.addEventListener('drop', event => setFiles(event.dataTransfer.files));
+    ui.drop.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') ui.input.click(); });
+    $('browseButton').addEventListener('click', event => { event.stopPropagation(); ui.input.click(); });
+    $('clearFilesButton').addEventListener('click', () => { state.files = []; renderFiles(); });
+    ui.drop.addEventListener('click', event => { if (!event.target.closest('button, input')) ui.input.click(); });
+    ui.input.addEventListener('change', () => { setFiles(ui.input.files); ui.input.value = ''; });
+    ui.words.addEventListener('input', updateStartState);
+    ui.words.addEventListener('keydown', event => { if (event.ctrlKey && event.key === 'Enter' && !ui.start.disabled) start(); });
+    ui.save.addEventListener('click', chooseOutput);
+    $('copyButton').addEventListener('click', copyResults);
+    ui.start.addEventListener('click', start);
+    ui.cancel.addEventListener('click', () => { state.cancelled = true; ui.cancel.disabled = true; ui.status.textContent = '中止処理中'; });
+    if (!window.showSaveFilePicker) { ui.save.disabled = true; ui.saveHint.textContent = '画面表示のみ利用できます。逐次保存には最新版のChromeまたはEdgeが必要です。'; }
+  </script>
+</body>
+</html>
