@@ -164,7 +164,11 @@ def build_byte_prefilter(options: SearchOptions, encoding: str) -> ByteSearchPla
         groups = [
             (
                 [
-                    (term if options.case_sensitive else term.casefold()).encode(codec, errors="strict")
+                    (
+                        term.encode(codec, errors="strict")
+                        if options.case_sensitive
+                        else term.casefold().encode(codec, errors="strict").lower()
+                    )
                     for term in group.terms
                 ],
                 group.mode,
@@ -228,6 +232,7 @@ def extract_logs(
                     if byte_prefilter is not None:
                         source.seek(0)
                         last_progress = 0
+                        last_update = 0.0
                         byte_groups = byte_prefilter.groups
                         single_group = byte_groups[0] if len(byte_groups) == 1 else None
                         ignore_case = byte_prefilter.ignore_case
@@ -259,17 +264,23 @@ def extract_logs(
                                     output.write(line + "\n")
                                     match_count += 1
                                     preview_batch.append(line)
-                                    if len(preview_batch) >= PREVIEW_EVENT_LIMIT:
-                                        emit("preview", {"lines": preview_batch, "matches": match_count})
-                                        preview_batch = []
+                                    if len(preview_batch) >= PREVIEW_EVENT_LIMIT * 2:
+                                        del preview_batch[:-PREVIEW_EVENT_LIMIT]
                             if file_read - last_progress >= CHUNK_SIZE:
                                 if cancel.is_set():
                                     break
-                                if preview_batch:
-                                    emit("preview", {"lines": preview_batch, "matches": match_count})
-                                    preview_batch = []
-                                emit("progress", {"done": completed_bytes + file_read, "total": total_bytes})
+                                now = time.monotonic()
+                                if now - last_update >= 0.1:
+                                    if preview_batch:
+                                        emit(
+                                            "preview",
+                                            {"lines": preview_batch[-PREVIEW_EVENT_LIMIT:], "matches": match_count},
+                                        )
+                                        preview_batch = []
+                                    emit("progress", {"done": completed_bytes + file_read, "total": total_bytes})
+                                    last_update = now
                                 last_progress = file_read
+                                time.sleep(0)
                     else:
                         decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
                         pending = ""

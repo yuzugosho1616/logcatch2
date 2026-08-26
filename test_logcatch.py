@@ -154,15 +154,46 @@ class LogCatchTests(unittest.TestCase):
 
     def test_byte_prefilter_supports_cp932_japanese_and_ascii(self):
         options = SearchOptions(
-            [SearchGroup(["座村清市", "error"], "and")],
+            [SearchGroup(["Create", "スパイダーアーティファクト", "型"], "and")],
             "and",
             False,
             "auto",
         )
         prefilter = build_byte_prefilter(options, "cp932")
         self.assertIsNotNone(prefilter)
-        self.assertTrue(prefilter("ERROR 座村清市".encode("cp932")))
-        self.assertFalse(prefilter("INFO 座村清市".encode("cp932")))
+        self.assertTrue(prefilter("Item Create Item:スパイダーアーティファクト1型".encode("cp932")))
+        self.assertFalse(prefilter("Item Create Item:別のアイテム1型".encode("cp932")))
+
+    def test_fast_path_extracts_cp932_terms_with_ascii_trail_bytes(self):
+        token = uuid.uuid4().hex
+        source = Path(f".test_{token}_cp932_spider.log")
+        output = Path(f".test_{token}_cp932_spider_result.log")
+        lines = [
+            "23:17:24 [雛罠] CBLargeMix Item Create Item:スパイダーアーティファクト1型 [1776055213]",
+            "23:17:24 [雛罠] CBLargeMix Item Create Item:スパイダーアーティファクト5型 [1776055214]",
+            "23:17:24 [雛罠] CBLargeMix Item Create Item:スパイダーアーティファクト4型 [1776055215]",
+        ]
+        try:
+            source.write_bytes(("\n".join(lines) + "\n").encode("cp932"))
+            extraction = extract_logs(
+                [source],
+                SearchOptions(
+                    [SearchGroup(["Create", "スパイダーアーティファクト", "型"], "and")],
+                    "and",
+                    False,
+                    "auto",
+                ),
+                output,
+                threading.Event(),
+                lambda _kind, _payload: None,
+            )
+            result = output.read_text(encoding="utf-8")
+            self.assertEqual(extraction.matches, 3)
+            for line in lines:
+                self.assertIn(line, result)
+        finally:
+            source.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
 
     def test_unicode_casefold_condition_uses_compatible_fallback(self):
         options = SearchOptions([SearchGroup(["ärger"], "and")], "and", False, "auto")
