@@ -13,6 +13,7 @@ from logcatch import (
     detect_encoding,
     extract_logs,
     format_elapsed,
+    preserve_nonblank_terms,
 )
 
 
@@ -20,6 +21,12 @@ class LogCatchTests(unittest.TestCase):
     def test_format_elapsed(self):
         self.assertEqual(format_elapsed(0), "00:00:00")
         self.assertEqual(format_elapsed(3661.9), "01:01:01")
+
+    def test_search_terms_preserve_meaningful_edge_spaces(self):
+        self.assertEqual(
+            preserve_nonblank_terms([" CBMix", "   ", "テンプルガード強化石", "型 "]),
+            [" CBMix", "テンプルガード強化石", "型 "],
+        )
 
     def test_result_path_uses_start_timestamp_without_overwriting(self):
         root = Path(f".test_results_{uuid.uuid4().hex}")
@@ -191,6 +198,36 @@ class LogCatchTests(unittest.TestCase):
             self.assertEqual(extraction.matches, 3)
             for line in lines:
                 self.assertIn(line, result)
+        finally:
+            source.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
+
+    def test_fast_path_respects_leading_space_in_search_term(self):
+        token = uuid.uuid4().hex
+        source = Path(f".test_{token}_leading_space.log")
+        output = Path(f".test_{token}_leading_space_result.log")
+        excluded = (
+            "14:17:21 [CBMix][NewUI] [愛ra] Add mixItem "
+            "[帰属]輝くテンプルガード強化石"
+        )
+        included = (
+            "14:17:21 [CBMix][NewUI] [愛ra]  CBMix(Cnt 12) "
+            "[帰属]輝くテンプルガード強化石"
+        )
+        try:
+            source.write_bytes(f"{excluded}\n{included}\n".encode("cp932"))
+            terms = preserve_nonblank_terms([" CBMix", "テンプルガード強化石"])
+            extraction = extract_logs(
+                [source],
+                SearchOptions([SearchGroup(terms, "and")], "and", False, "auto"),
+                output,
+                threading.Event(),
+                lambda _kind, _payload: None,
+            )
+            result = output.read_text(encoding="utf-8")
+            self.assertEqual(extraction.matches, 1)
+            self.assertNotIn(excluded, result)
+            self.assertIn(included, result)
         finally:
             source.unlink(missing_ok=True)
             output.unlink(missing_ok=True)

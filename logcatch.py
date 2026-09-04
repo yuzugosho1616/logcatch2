@@ -46,6 +46,10 @@ def format_elapsed(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def preserve_nonblank_terms(values: Iterable[str]) -> list[str]:
+    return [value for value in values if value.strip()]
+
+
 def application_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -453,7 +457,7 @@ class LogCatchApp:
         self.encoding_var = tk.StringVar(value="auto")
         self.encoding_combo = ttk.Combobox(options, textvariable=self.encoding_var, values=("auto", "utf-8", "cp932"), state="readonly", width=10)
         self.encoding_combo.pack(side="left")
-        ttk.Label(options, text="※ 入力欄内のカンマも検索文字として扱います", foreground="#66717e").pack(side="left", padx=(18, 0))
+        ttk.Label(options, text="※ カンマと先頭・末尾の空白も検索文字として扱います", foreground="#66717e").pack(side="left", padx=(18, 0))
 
         self.add_condition_group(term_count=3)
 
@@ -590,8 +594,7 @@ class LogCatchApp:
     def collect_search_groups(self) -> list[SearchGroup]:
         groups: list[SearchGroup] = []
         for group in self.condition_groups:
-            terms = [term["variable"].get().strip() for term in group["terms"]]
-            terms = [term for term in terms if term]
+            terms = preserve_nonblank_terms(term["variable"].get() for term in group["terms"])
             if terms:
                 mode = "and" if group["mode_var"].get() == GROUP_ALL_LABEL else "or"
                 groups.append(SearchGroup(terms, mode))
