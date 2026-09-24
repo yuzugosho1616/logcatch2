@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -23,10 +23,12 @@ PREVIEW_EVENT_LIMIT = 500
 COPY_WARNING_BYTES = 100 * 1024 * 1024
 EVENT_QUEUE_LIMIT = 100
 EVENTS_PER_POLL = 50
-GROUP_ALL_LABEL = "すべて含む (AND)"
-GROUP_ANY_LABEL = "いずれかを含む (OR)"
+GROUP_ALL_LABEL = "すべての条件を満たす (AND)"
+GROUP_ANY_LABEL = "いずれかの条件を満たす (OR)"
 OVERALL_ALL_LABEL = "すべてのグループを満たす (AND)"
 OVERALL_ANY_LABEL = "いずれかのグループを満たす (OR)"
+TERM_INCLUDE_LABEL = "含む"
+TERM_EXCLUDE_LABEL = "含まない (NOT)"
 
 
 def format_bytes(size: int) -> str:
@@ -94,6 +96,7 @@ def detect_encoding(path: Path, requested: str) -> str:
 class SearchGroup:
     terms: list[str]
     mode: str
+    excluded_terms: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -112,17 +115,22 @@ class ExtractionResult:
 
 @dataclass(frozen=True)
 class ByteSearchPlan:
-    groups: list[tuple[list[bytes], str]]
+    groups: list[tuple[list[bytes], list[bytes], str]]
     group_mode: str
     ignore_case: bool
 
     def __call__(self, line: bytes) -> bool:
         haystack = line.lower() if self.ignore_case else line
 
-        def group_matches(group: tuple[list[bytes], str]) -> bool:
-            terms, mode = group
-            checks = (term in haystack for term in terms)
-            return all(checks) if mode == "and" else any(checks)
+        def group_matches(group: tuple[list[bytes], list[bytes], str]) -> bool:
+            terms, excluded_terms, mode = group
+            if mode == "and":
+                return all(term in haystack for term in terms) and all(
+                    term not in haystack for term in excluded_terms
+                )
+            return any(term in haystack for term in terms) or any(
+                term not in haystack for term in excluded_terms
+            )
 
         results = (group_matches(group) for group in self.groups)
         return all(results) if self.group_mode == "and" else any(results)
@@ -136,6 +144,11 @@ def build_text_matcher(options: SearchOptions) -> Callable[[str], bool]:
         SearchGroup(
             group.terms if options.case_sensitive else [term.casefold() for term in group.terms],
             group.mode,
+            (
+                group.excluded_terms
+                if options.case_sensitive
+                else [term.casefold() for term in group.excluded_terms]
+            ),
         )
         for group in options.groups
     ]
@@ -144,8 +157,13 @@ def build_text_matcher(options: SearchOptions) -> Callable[[str], bool]:
         haystack = line if options.case_sensitive else line.casefold()
 
         def group_matches(group: SearchGroup) -> bool:
-            checks = (term in haystack for term in group.terms)
-            return all(checks) if group.mode == "and" else any(checks)
+            if group.mode == "and":
+                return all(term in haystack for term in group.terms) and all(
+                    term not in haystack for term in group.excluded_terms
+                )
+            return any(term in haystack for term in group.terms) or any(
+                term not in haystack for term in group.excluded_terms
+            )
 
         results = (group_matches(group) for group in groups)
         return all(results) if options.group_mode == "and" else any(results)
@@ -159,7 +177,9 @@ def supports_byte_casefold(term: str) -> bool:
 
 def build_byte_prefilter(options: SearchOptions, encoding: str) -> ByteSearchPlan | None:
     if not options.case_sensitive and not all(
-        supports_byte_casefold(term) for group in options.groups for term in group.terms
+        supports_byte_casefold(term)
+        for group in options.groups
+        for term in (*group.terms, *group.excluded_terms)
     ):
         return None
 
@@ -174,6 +194,14 @@ def build_byte_prefilter(options: SearchOptions, encoding: str) -> ByteSearchPla
                         else term.casefold().encode(codec, errors="strict").lower()
                     )
                     for term in group.terms
+                ],
+                [
+                    (
+                        term.encode(codec, errors="strict")
+                        if options.case_sensitive
+                        else term.casefold().encode(codec, errors="strict").lower()
+                    )
+                    for term in group.excluded_terms
                 ],
                 group.mode,
             )
@@ -244,14 +272,28 @@ def extract_logs(
                             file_read += len(raw_line)
                             haystack = raw_line.lower() if ignore_case else raw_line
                             if single_group is not None:
-                                terms, mode = single_group
-                                checks = (term in haystack for term in terms)
-                                is_candidate = all(checks) if mode == "and" else any(checks)
+                                terms, excluded_terms, mode = single_group
+                                if mode == "and":
+                                    is_candidate = all(term in haystack for term in terms) and all(
+                                        term not in haystack for term in excluded_terms
+                                    )
+                                else:
+                                    is_candidate = any(term in haystack for term in terms) or any(
+                                        term not in haystack for term in excluded_terms
+                                    )
                             else:
                                 group_results = []
-                                for terms, mode in byte_groups:
-                                    checks = (term in haystack for term in terms)
-                                    group_results.append(all(checks) if mode == "and" else any(checks))
+                                for terms, excluded_terms, mode in byte_groups:
+                                    if mode == "and":
+                                        group_results.append(
+                                            all(term in haystack for term in terms)
+                                            and all(term not in haystack for term in excluded_terms)
+                                        )
+                                    else:
+                                        group_results.append(
+                                            any(term in haystack for term in terms)
+                                            or any(term not in haystack for term in excluded_terms)
+                                        )
                                 is_candidate = (
                                     all(group_results)
                                     if byte_prefilter.group_mode == "and"
@@ -550,13 +592,30 @@ class LogCatchApp:
     def add_condition_term(self, group: dict, refresh: bool = True) -> None:
         row = ttk.Frame(group["terms_frame"])
         row.pack(fill="x", pady=2)
+        type_variable = tk.StringVar(value=TERM_INCLUDE_LABEL)
+        type_combo = ttk.Combobox(
+            row,
+            textvariable=type_variable,
+            values=(TERM_INCLUDE_LABEL, TERM_EXCLUDE_LABEL),
+            state="readonly",
+            width=14,
+        )
+        type_combo.pack(side="left", padx=(0, 7))
         variable = tk.StringVar()
         entry = ttk.Entry(row, textvariable=variable)
         entry.pack(side="left", fill="x", expand=True)
         delete_button = ttk.Button(row, text="削除", width=7)
         delete_button.pack(side="left", padx=(7, 0))
-        term = {"row": row, "variable": variable, "entry": entry, "delete_button": delete_button}
+        term = {
+            "row": row,
+            "type_variable": type_variable,
+            "type_combo": type_combo,
+            "variable": variable,
+            "entry": entry,
+            "delete_button": delete_button,
+        }
         delete_button.configure(command=lambda: self.delete_condition_term(group, term))
+        type_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_condition_changed())
         variable.trace_add("write", lambda *_args: self.on_condition_changed())
         group["terms"].append(term)
         if refresh:
@@ -594,10 +653,17 @@ class LogCatchApp:
     def collect_search_groups(self) -> list[SearchGroup]:
         groups: list[SearchGroup] = []
         for group in self.condition_groups:
-            terms = preserve_nonblank_terms(term["variable"].get() for term in group["terms"])
-            if terms:
+            terms: list[str] = []
+            excluded_terms: list[str] = []
+            for term in group["terms"]:
+                value = term["variable"].get()
+                if not value.strip():
+                    continue
+                target = excluded_terms if term["type_variable"].get() == TERM_EXCLUDE_LABEL else terms
+                target.append(value)
+            if terms or excluded_terms:
                 mode = "and" if group["mode_var"].get() == GROUP_ALL_LABEL else "or"
-                groups.append(SearchGroup(terms, mode))
+                groups.append(SearchGroup(terms, mode, excluded_terms))
         return groups
 
     def update_condition_summary(self) -> None:
@@ -605,8 +671,11 @@ class LogCatchApp:
         if not groups:
             text = "検索語を1つ以上入力してください"
         elif len(groups) == 1:
-            relation = "すべて含む" if groups[0].mode == "and" else "いずれかを含む"
-            text = f"検索方法: 入力した{len(groups[0].terms)}語を{relation}行"
+            relation = "すべて満たす" if groups[0].mode == "and" else "いずれかを満たす"
+            condition_count = len(groups[0].terms) + len(groups[0].excluded_terms)
+            not_count = len(groups[0].excluded_terms)
+            not_text = f"（NOT {not_count}件）" if not_count else ""
+            text = f"検索方法: {condition_count}条件を{relation}行{not_text}"
         else:
             relation = "すべて満たす" if self.overall_mode_var.get() == OVERALL_ALL_LABEL else "いずれかを満たす"
             text = f"検索方法: {len(groups)}個の条件グループを{relation}行"
@@ -665,6 +734,7 @@ class LogCatchApp:
             can_delete_group = enabled and len(self.condition_groups) > 1
             group["delete_button"].configure(state="normal" if can_delete_group else "disabled")
             for term in group["terms"]:
+                term["type_combo"].configure(state=combo_state)
                 term["entry"].configure(state=normal_state)
                 term["delete_button"].configure(state=normal_state)
 

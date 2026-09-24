@@ -111,6 +111,57 @@ class LogCatchTests(unittest.TestCase):
             source.unlink(missing_ok=True)
             output.unlink(missing_ok=True)
 
+    def test_not_condition_excludes_matching_lines_on_fast_path(self):
+        token = uuid.uuid4().hex
+        source = Path(f".test_{token}_not.log")
+        output = Path(f".test_{token}_not_result.log")
+        try:
+            source.write_bytes("Create 成功\nCreate Error 失敗\nOther 成功\n".encode("cp932"))
+            options = SearchOptions(
+                [SearchGroup(["Create"], "and", ["Error"])],
+                "and",
+                False,
+                "auto",
+            )
+            self.assertIsNotNone(build_byte_prefilter(options, "cp932"))
+            extraction = extract_logs(
+                [source],
+                options,
+                output,
+                threading.Event(),
+                lambda _kind, _payload: None,
+            )
+            result = output.read_text(encoding="utf-8")
+            self.assertEqual(extraction.matches, 1)
+            self.assertIn("Create 成功", result)
+            self.assertNotIn("Create Error 失敗", result)
+            self.assertNotIn("Other 成功", result)
+        finally:
+            source.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
+
+    def test_not_only_condition_extracts_lines_without_term(self):
+        token = uuid.uuid4().hex
+        source = Path(f".test_{token}_not_only.log")
+        output = Path(f".test_{token}_not_only_result.log")
+        try:
+            source.write_text("INFO ok\nDEBUG details\nERROR\n", encoding="utf-8")
+            extraction = extract_logs(
+                [source],
+                SearchOptions([SearchGroup([], "and", ["DEBUG"])], "and", False, "auto"),
+                output,
+                threading.Event(),
+                lambda _kind, _payload: None,
+            )
+            result = output.read_text(encoding="utf-8")
+            self.assertEqual(extraction.matches, 2)
+            self.assertIn("INFO ok", result)
+            self.assertIn("ERROR", result)
+            self.assertNotIn("DEBUG details", result)
+        finally:
+            source.unlink(missing_ok=True)
+            output.unlink(missing_ok=True)
+
     def test_continues_after_unreadable_file_and_records_error(self):
         token = uuid.uuid4().hex
         missing = Path(f".test_{token}_missing.log")
