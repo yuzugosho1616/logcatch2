@@ -4,7 +4,8 @@ python -m PyInstaller `
     --noconfirm `
     --clean `
     --onefile `
-    --windowed `
+    --console `
+    --hide-console hide-early `
     --name LogCatch `
     --collect-all tkinterdnd2 `
     logcatch.py
