@@ -14,6 +14,7 @@ from logcatch import (
     extract_logs,
     format_elapsed,
     preserve_nonblank_terms,
+    sanitize_search_term,
 )
 
 
@@ -27,6 +28,11 @@ class LogCatchTests(unittest.TestCase):
             preserve_nonblank_terms([" CBMix", "   ", "テンプルガード強化石", "型 "]),
             [" CBMix", "テンプルガード強化石", "型 "],
         )
+
+    def test_sanitize_search_term_removes_only_trailing_line_breaks(self):
+        self.assertEqual(sanitize_search_term("あいうえお\r\n"), "あいうえお")
+        self.assertEqual(sanitize_search_term(" 前後の空白 \r\n"), " 前後の空白 ")
+        self.assertEqual(sanitize_search_term("一行目\n二行目"), "一行目\n二行目")
 
     def test_result_path_uses_start_timestamp_without_overwriting(self):
         root = Path(f".test_results_{uuid.uuid4().hex}")

@@ -52,6 +52,10 @@ def preserve_nonblank_terms(values: Iterable[str]) -> list[str]:
     return [value for value in values if value.strip()]
 
 
+def sanitize_search_term(value: str) -> str:
+    return value.rstrip("\r\n")
+
+
 def application_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -604,6 +608,7 @@ class LogCatchApp:
         variable = tk.StringVar()
         entry = ttk.Entry(row, textvariable=variable)
         entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<<Paste>>", self.paste_condition_term)
         delete_button = ttk.Button(row, text="削除", width=7)
         delete_button.pack(side="left", padx=(7, 0))
         term = {
@@ -650,13 +655,30 @@ class LogCatchApp:
         self.update_condition_summary()
         self.update_controls()
 
+    def paste_condition_term(self, event: tk.Event) -> str | None:
+        entry = event.widget
+        try:
+            pasted_text = self.root.clipboard_get()
+        except tk.TclError:
+            return None
+
+        pasted_text = sanitize_search_term(pasted_text)
+        try:
+            insert_at = entry.index("sel.first")
+            entry.delete("sel.first", "sel.last")
+        except tk.TclError:
+            insert_at = entry.index("insert")
+        entry.insert(insert_at, pasted_text)
+        entry.icursor(insert_at + len(pasted_text))
+        return "break"
+
     def collect_search_groups(self) -> list[SearchGroup]:
         groups: list[SearchGroup] = []
         for group in self.condition_groups:
             terms: list[str] = []
             excluded_terms: list[str] = []
             for term in group["terms"]:
-                value = term["variable"].get()
+                value = sanitize_search_term(term["variable"].get())
                 if not value.strip():
                     continue
                 target = excluded_terms if term["type_variable"].get() == TERM_EXCLUDE_LABEL else terms
