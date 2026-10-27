@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +79,46 @@ def create_result_path(base_directory: Path, started_at: datetime | None = None)
             suffix += 1
 
 
+def sanitize_output_name(value: str, fallback: str) -> str:
+    invalid = '<>:"/\\|?*'
+    cleaned = "".join("_" if character in invalid or ord(character) < 32 else character for character in value)
+    cleaned = cleaned.strip().rstrip(".")
+    return (cleaned or fallback)[:80]
+
+
+def create_result_paths(
+    base_directory: Path,
+    output_names: Iterable[str],
+    started_at: datetime | None = None,
+) -> list[Path]:
+    names = list(output_names)
+    if len(names) == 1:
+        return [create_result_path(base_directory, started_at)]
+
+    result_directory = base_directory / "results"
+    result_directory.mkdir(parents=True, exist_ok=True)
+    timestamp = (started_at or datetime.now()).strftime("%Y%m%d%H%M%S")
+    paths: list[Path] = []
+    try:
+        for index, name in enumerate(names, start=1):
+            safe_name = sanitize_output_name(name, f"条件{index}")
+            candidate = result_directory / f"logcatch_{timestamp}_{safe_name}.log"
+            suffix = 2
+            while True:
+                try:
+                    candidate.touch(exist_ok=False)
+                    paths.append(candidate)
+                    break
+                except FileExistsError:
+                    candidate = result_directory / f"logcatch_{timestamp}_{safe_name}_{suffix}.log"
+                    suffix += 1
+    except OSError:
+        for path in paths:
+            path.unlink(missing_ok=True)
+        raise
+    return paths
+
+
 def detect_encoding_from_sample(sample: bytes, requested: str) -> str:
     if requested != "auto":
         return requested
@@ -118,6 +160,19 @@ class ExtractionResult:
 
 
 @dataclass(frozen=True)
+class MultiSearchRule:
+    name: str
+    options: SearchOptions
+    output_path: Path
+
+
+@dataclass(frozen=True)
+class MultiExtractionResult:
+    matches: list[int]
+    file_errors: int
+
+
+@dataclass(frozen=True)
 class ByteSearchPlan:
     groups: list[tuple[list[bytes], list[bytes], str]]
     group_mode: str
@@ -125,19 +180,24 @@ class ByteSearchPlan:
 
     def __call__(self, line: bytes) -> bool:
         haystack = line.lower() if self.ignore_case else line
+        return self.matches_haystack(haystack)
 
-        def group_matches(group: tuple[list[bytes], list[bytes], str]) -> bool:
+    def matches_haystack(self, haystack: bytes) -> bool:
+        for group in self.groups:
             terms, excluded_terms, mode = group
             if mode == "and":
-                return all(term in haystack for term in terms) and all(
+                group_matches = all(term in haystack for term in terms) and all(
                     term not in haystack for term in excluded_terms
                 )
-            return any(term in haystack for term in terms) or any(
-                term not in haystack for term in excluded_terms
-            )
-
-        results = (group_matches(group) for group in self.groups)
-        return all(results) if self.group_mode == "and" else any(results)
+            else:
+                group_matches = any(term in haystack for term in terms) or any(
+                    term not in haystack for term in excluded_terms
+                )
+            if self.group_mode == "and" and not group_matches:
+                return False
+            if self.group_mode == "or" and group_matches:
+                return True
+        return self.group_mode == "and"
 
 
 EventCallback = Callable[[str, dict], None]
@@ -389,23 +449,259 @@ def extract_logs(
     return ExtractionResult(match_count, file_errors)
 
 
+def extract_logs_multi(
+    paths: Iterable[Path],
+    rules: list[MultiSearchRule],
+    cancel: threading.Event,
+    emit: EventCallback,
+) -> MultiExtractionResult:
+    if not rules:
+        return MultiExtractionResult([], 0)
+
+    files = list(paths)
+    file_sizes: dict[Path, int] = {}
+    for path in files:
+        try:
+            file_sizes[path] = path.stat().st_size
+        except OSError:
+            file_sizes[path] = 0
+    total_bytes = sum(file_sizes.values())
+    completed_bytes = 0
+    match_counts = [0] * len(rules)
+    file_errors = 0
+    text_matchers = [build_text_matcher(rule.options) for rule in rules]
+    requested_encoding = rules[0].options.encoding
+
+    with ExitStack() as stack:
+        outputs = [
+            stack.enter_context(
+                rule.output_path.open("w", encoding="utf-8", newline="\n", buffering=CHUNK_SIZE)
+            )
+            for rule in rules
+        ]
+        for file_index, path in enumerate(files):
+            if cancel.is_set():
+                break
+            if file_index:
+                for rule_index, output in enumerate(outputs):
+                    output.write("\n")
+                    emit("marker", {"rule": rule_index, "lines": [""]})
+
+            open_marker = f"[===Open File :{path}==]"
+            for rule_index, output in enumerate(outputs):
+                output.write(open_marker + "\n")
+                emit("marker", {"rule": rule_index, "lines": [open_marker]})
+
+            file_read = 0
+            had_file_error = False
+            preview_batches: list[list[str]] = [[] for _rule in rules]
+            try:
+                with path.open("rb", buffering=CHUNK_SIZE) as source:
+                    first_chunk = source.read(CHUNK_SIZE) if requested_encoding == "auto" else None
+                    encoding = detect_encoding_from_sample(first_chunk or b"", requested_encoding)
+                    byte_plans = [build_byte_prefilter(rule.options, encoding) for rule in rules]
+                    all_fast = all(plan is not None for plan in byte_plans)
+                    emit(
+                        "file",
+                        {
+                            "index": file_index + 1,
+                            "count": len(files),
+                            "path": str(path),
+                            "encoding": encoding,
+                            "fast_path": all_fast,
+                        },
+                    )
+
+                    if all_fast:
+                        source.seek(0)
+                        plans = [plan for plan in byte_plans if plan is not None]
+                        needs_lower = any(plan.ignore_case for plan in plans)
+                        plan_groups = [plan.groups for plan in plans]
+                        plan_modes = [plan.group_mode for plan in plans]
+                        single_groups = [groups[0] if len(groups) == 1 else None for groups in plan_groups]
+                        last_progress = 0
+                        last_update = 0.0
+                        for raw_line in source:
+                            file_read += len(raw_line)
+                            lowered = raw_line.lower() if needs_lower else raw_line
+                            candidates: list[bool] = []
+                            for rule_index, plan in enumerate(plans):
+                                haystack = lowered if plan.ignore_case else raw_line
+                                single_group = single_groups[rule_index]
+                                if single_group is not None:
+                                    terms, excluded_terms, mode = single_group
+                                    if not excluded_terms and len(terms) == 1:
+                                        is_candidate = terms[0] in haystack
+                                    elif mode == "and":
+                                        is_candidate = all(term in haystack for term in terms) and all(
+                                            term not in haystack for term in excluded_terms
+                                        )
+                                    else:
+                                        is_candidate = any(term in haystack for term in terms) or any(
+                                            term not in haystack for term in excluded_terms
+                                        )
+                                else:
+                                    group_results = []
+                                    for terms, excluded_terms, mode in plan_groups[rule_index]:
+                                        if mode == "and":
+                                            group_results.append(
+                                                all(term in haystack for term in terms)
+                                                and all(term not in haystack for term in excluded_terms)
+                                            )
+                                        else:
+                                            group_results.append(
+                                                any(term in haystack for term in terms)
+                                                or any(term not in haystack for term in excluded_terms)
+                                            )
+                                    is_candidate = (
+                                        all(group_results)
+                                        if plan_modes[rule_index] == "and"
+                                        else any(group_results)
+                                    )
+                                candidates.append(is_candidate)
+                            if any(candidates):
+                                content = raw_line.removesuffix(b"\n").removesuffix(b"\r")
+                                line = content.decode(encoding, errors="replace")
+                                for rule_index, is_candidate in enumerate(candidates):
+                                    if is_candidate and text_matchers[rule_index](line):
+                                        outputs[rule_index].write(line + "\n")
+                                        match_counts[rule_index] += 1
+                                        batch = preview_batches[rule_index]
+                                        batch.append(line)
+                                        if len(batch) >= PREVIEW_EVENT_LIMIT * 2:
+                                            del batch[:-PREVIEW_EVENT_LIMIT]
+
+                            if file_read - last_progress >= CHUNK_SIZE:
+                                if cancel.is_set():
+                                    break
+                                now = time.monotonic()
+                                if now - last_update >= 0.1:
+                                    for rule_index, batch in enumerate(preview_batches):
+                                        if batch:
+                                            emit(
+                                                "preview",
+                                                {
+                                                    "rule": rule_index,
+                                                    "lines": batch[-PREVIEW_EVENT_LIMIT:],
+                                                    "matches": match_counts[rule_index],
+                                                },
+                                            )
+                                            preview_batches[rule_index] = []
+                                    emit(
+                                        "progress",
+                                        {"done": completed_bytes + file_read, "total": total_bytes},
+                                    )
+                                    last_update = now
+                                last_progress = file_read
+                                time.sleep(0)
+                    else:
+                        decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+                        pending = ""
+                        last_update = 0.0
+                        while not cancel.is_set():
+                            if first_chunk is not None:
+                                chunk = first_chunk
+                                first_chunk = None
+                            else:
+                                chunk = source.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            file_read += len(chunk)
+                            text = pending + decoder.decode(chunk, final=False)
+                            lines = text.split("\n")
+                            pending = lines.pop()
+                            for line in lines:
+                                line = line.removesuffix("\r")
+                                for rule_index, matcher in enumerate(text_matchers):
+                                    if matcher(line):
+                                        outputs[rule_index].write(line + "\n")
+                                        match_counts[rule_index] += 1
+                                        preview_batches[rule_index].append(line)
+                            now = time.monotonic()
+                            if now - last_update >= 0.1:
+                                for rule_index, batch in enumerate(preview_batches):
+                                    if batch:
+                                        emit(
+                                            "preview",
+                                            {
+                                                "rule": rule_index,
+                                                "lines": batch[-PREVIEW_EVENT_LIMIT:],
+                                                "matches": match_counts[rule_index],
+                                            },
+                                        )
+                                        preview_batches[rule_index] = []
+                                emit(
+                                    "progress",
+                                    {"done": completed_bytes + file_read, "total": total_bytes},
+                                )
+                                last_update = now
+
+                        if not cancel.is_set():
+                            pending += decoder.decode(b"", final=True)
+                            if pending:
+                                line = pending.removesuffix("\r")
+                                for rule_index, matcher in enumerate(text_matchers):
+                                    if matcher(line):
+                                        outputs[rule_index].write(line + "\n")
+                                        match_counts[rule_index] += 1
+                                        preview_batches[rule_index].append(line)
+            except OSError as error:
+                file_errors += 1
+                had_file_error = True
+                error_marker = f"[===Error File :{path} | {error}==]"
+                for rule_index, output in enumerate(outputs):
+                    output.write(error_marker + "\n")
+                    emit("marker", {"rule": rule_index, "lines": [error_marker]})
+                emit("file_error", {"path": str(path), "message": str(error)})
+
+            for rule_index, batch in enumerate(preview_batches):
+                if batch:
+                    emit(
+                        "preview",
+                        {
+                            "rule": rule_index,
+                            "lines": batch[-PREVIEW_EVENT_LIMIT:],
+                            "matches": match_counts[rule_index],
+                        },
+                    )
+            close_marker = f"[===Close File :{path}==]"
+            for rule_index, output in enumerate(outputs):
+                output.write(close_marker + "\n")
+                output.flush()
+                emit(
+                    "marker",
+                    {"rule": rule_index, "lines": [close_marker], "matches": match_counts[rule_index]},
+                )
+            completed_bytes += file_sizes[path] if had_file_error else file_read
+            emit("progress", {"done": completed_bytes, "total": total_bytes})
+
+    return MultiExtractionResult(match_counts, file_errors)
+
+
 class LogCatchApp:
     def __init__(self) -> None:
         self.root = TkinterDnD.Tk()
         self.root.title("LogCatch")
-        self.root.geometry("1040x860")
-        self.root.minsize(760, 600)
+        self.root.geometry("1080x900")
+        self.root.minsize(820, 650)
         self.files: list[Path] = []
         self.running = False
         self.cancel_event = threading.Event()
         self.events: queue.Queue[tuple[str, dict]] = queue.Queue(maxsize=EVENT_QUEUE_LIMIT)
         self.result_path: Path | None = None
+        self.result_paths: list[Path] = []
+        self.result_names: list[str] = []
+        self.result_display_names: list[str] = []
+        self.match_counts: list[int] = []
+        self.preview_buffers: list[deque[str]] = []
+        self.selected_result_index = 0
         self.match_count = 0
         self.file_error_count = 0
         self.preview_line_count = 0
         self.started_at: float | None = None
         self.elapsed_seconds = 0.0
-        self.condition_groups: list[dict] = []
+        self.condition_sets: list[dict] = []
+        self.next_condition_number = 1
         self._build_style()
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -443,7 +739,7 @@ class LogCatchApp:
 
         list_frame = ttk.Frame(body)
         list_frame.pack(fill="x", pady=(8, 16))
-        self.file_list = tk.Listbox(list_frame, height=7, font=("Consolas", 9), activestyle="none", selectmode="extended")
+        self.file_list = tk.Listbox(list_frame, height=5, font=("Consolas", 9), activestyle="none", selectmode="extended")
         file_y = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_list.yview)
         file_x = ttk.Scrollbar(list_frame, orient="horizontal", command=self.file_list.xview)
         self.file_list.configure(yscrollcommand=file_y.set, xscrollcommand=file_x.set)
@@ -459,40 +755,23 @@ class LogCatchApp:
         ttk.Label(search_head, text="2. 検索条件", style="Section.TLabel").pack(side="left")
         self.start_button = ttk.Button(search_head, text="抽出を開始", style="Accent.TButton", command=self.start_search, state="disabled")
         self.start_button.pack(side="right")
-
-        overall = ttk.Frame(body)
-        overall.pack(fill="x", pady=(8, 6))
-        ttk.Label(overall, text="複数の条件グループがある場合:").pack(side="left")
-        self.overall_mode_var = tk.StringVar(value=OVERALL_ALL_LABEL)
-        self.overall_mode_combo = ttk.Combobox(
-            overall,
-            textvariable=self.overall_mode_var,
-            values=(OVERALL_ALL_LABEL, OVERALL_ANY_LABEL),
-            state="readonly",
-            width=34,
+        self.delete_condition_set_button = ttk.Button(
+            search_head,
+            text="出力条件を削除",
+            command=self.delete_condition_set,
+            state="disabled",
         )
-        self.overall_mode_combo.pack(side="left", padx=(8, 0))
-        self.overall_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_condition_summary())
+        self.delete_condition_set_button.pack(side="right", padx=(8, 0))
+        self.add_condition_set_button = ttk.Button(
+            search_head,
+            text="＋ 出力条件を追加",
+            command=self.add_condition_set,
+        )
+        self.add_condition_set_button.pack(side="right", padx=(8, 0))
 
-        condition_area = ttk.Frame(body)
-        condition_area.pack(fill="x")
-        self.condition_canvas = tk.Canvas(condition_area, height=190, highlightthickness=1, highlightbackground="#aeb8c2")
-        condition_scroll = ttk.Scrollbar(condition_area, orient="vertical", command=self.condition_canvas.yview)
-        self.condition_canvas.configure(yscrollcommand=condition_scroll.set)
-        self.condition_canvas.grid(row=0, column=0, sticky="nsew")
-        condition_scroll.grid(row=0, column=1, sticky="ns")
-        condition_area.columnconfigure(0, weight=1)
-        self.condition_container = ttk.Frame(self.condition_canvas, padding=(6, 3))
-        self.condition_window = self.condition_canvas.create_window((0, 0), window=self.condition_container, anchor="nw")
-        self.condition_container.bind("<Configure>", self._resize_condition_scroll)
-        self.condition_canvas.bind("<Configure>", self._resize_condition_width)
-
-        condition_actions = ttk.Frame(body)
-        condition_actions.pack(fill="x", pady=(6, 4))
-        self.add_group_button = ttk.Button(condition_actions, text="＋ 条件グループを追加", command=self.add_condition_group)
-        self.add_group_button.pack(side="left")
-        self.condition_summary = ttk.Label(condition_actions, text="", foreground="#52606d")
-        self.condition_summary.pack(side="left", padx=(14, 0))
+        self.condition_notebook = ttk.Notebook(body)
+        self.condition_notebook.pack(fill="x", pady=(8, 6))
+        self.condition_notebook.bind("<<NotebookTabChanged>>", self.on_condition_tab_changed)
 
         options = ttk.Frame(body)
         options.pack(fill="x", pady=(2, 16))
@@ -505,7 +784,7 @@ class LogCatchApp:
         self.encoding_combo.pack(side="left")
         ttk.Label(options, text="※ カンマと先頭・末尾の空白も検索文字として扱います", foreground="#66717e").pack(side="left", padx=(18, 0))
 
-        self.add_condition_group(term_count=3)
+        self.add_condition_set(term_count=3)
 
         progress_head = ttk.Frame(body)
         progress_head.pack(fill="x")
@@ -527,6 +806,16 @@ class LogCatchApp:
         result_head = ttk.Frame(body)
         result_head.pack(fill="x")
         ttk.Label(result_head, text="4. 抽出結果", style="Section.TLabel").pack(side="left")
+        ttk.Label(result_head, text="表示:").pack(side="left", padx=(14, 5))
+        self.result_selection_var = tk.StringVar()
+        self.result_selection_combo = ttk.Combobox(
+            result_head,
+            textvariable=self.result_selection_var,
+            state="disabled",
+            width=24,
+        )
+        self.result_selection_combo.pack(side="left")
+        self.result_selection_combo.bind("<<ComboboxSelected>>", self.on_result_selected)
         self.cancel_button = ttk.Button(result_head, text="中止", command=self.cancel_search, state="disabled")
         self.cancel_button.pack(side="right")
         self.save_button = ttk.Button(result_head, text="名前を付けて保存", command=self.save_result, state="disabled")
@@ -550,14 +839,152 @@ class LogCatchApp:
         preview_frame.rowconfigure(0, weight=1)
         preview_frame.columnconfigure(0, weight=1)
 
-    def _resize_condition_scroll(self, _event: tk.Event | None = None) -> None:
-        self.condition_canvas.configure(scrollregion=self.condition_canvas.bbox("all"))
+    def current_condition_set(self) -> dict | None:
+        if not self.condition_sets:
+            return None
+        try:
+            index = self.condition_notebook.index("current")
+        except tk.TclError:
+            index = 0
+        return self.condition_sets[index]
 
-    def _resize_condition_width(self, event: tk.Event) -> None:
-        self.condition_canvas.itemconfigure(self.condition_window, width=event.width)
+    def condition_set_name(self, condition_set: dict) -> str:
+        fallback = f"条件{self.condition_sets.index(condition_set) + 1}"
+        return condition_set["name_var"].get().strip() or fallback
 
-    def add_condition_group(self, term_count: int = 1) -> None:
-        frame = ttk.LabelFrame(self.condition_container, padding=(8, 6))
+    def add_condition_set(self, term_count: int = 1) -> None:
+        number = self.next_condition_number
+        self.next_condition_number += 1
+        tab = ttk.Frame(self.condition_notebook, padding=(8, 7))
+
+        settings = ttk.Frame(tab)
+        settings.pack(fill="x", pady=(0, 6))
+        ttk.Label(settings, text="出力名:").pack(side="left")
+        name_var = tk.StringVar(value=f"条件{number}")
+        name_entry = ttk.Entry(settings, textvariable=name_var, width=22)
+        name_entry.pack(side="left", padx=(6, 20))
+        ttk.Label(settings, text="複数の条件グループがある場合:").pack(side="left")
+        overall_mode_var = tk.StringVar(value=OVERALL_ALL_LABEL)
+        overall_mode_combo = ttk.Combobox(
+            settings,
+            textvariable=overall_mode_var,
+            values=(OVERALL_ALL_LABEL, OVERALL_ANY_LABEL),
+            state="readonly",
+            width=34,
+        )
+        overall_mode_combo.pack(side="left", padx=(7, 0))
+
+        condition_area = ttk.Frame(tab)
+        condition_area.pack(fill="x")
+        canvas = tk.Canvas(
+            condition_area,
+            height=150,
+            highlightthickness=1,
+            highlightbackground="#aeb8c2",
+        )
+        scrollbar = ttk.Scrollbar(condition_area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        condition_area.columnconfigure(0, weight=1)
+        container = ttk.Frame(canvas, padding=(6, 3))
+        window = canvas.create_window((0, 0), window=container, anchor="nw")
+
+        actions = ttk.Frame(tab)
+        actions.pack(fill="x", pady=(6, 0))
+        summary = ttk.Label(actions, text="", foreground="#52606d")
+        summary.pack(side="left", padx=(14, 0))
+
+        condition_set: dict = {
+            "tab": tab,
+            "name_var": name_var,
+            "name_entry": name_entry,
+            "overall_mode_var": overall_mode_var,
+            "overall_mode_combo": overall_mode_combo,
+            "canvas": canvas,
+            "container": container,
+            "window": window,
+            "summary": summary,
+            "groups": [],
+        }
+        add_group_button = ttk.Button(
+            actions,
+            text="＋ 条件グループを追加",
+            command=lambda: self.add_condition_group(condition_set),
+        )
+        add_group_button.pack(side="left")
+        condition_set["add_group_button"] = add_group_button
+
+        container.bind(
+            "<Configure>",
+            lambda _event, item=condition_set: self._resize_condition_scroll(item),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event, item=condition_set: self._resize_condition_width(item, event),
+        )
+        overall_mode_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event, item=condition_set: self.update_condition_summary(item),
+        )
+        name_var.trace_add("write", lambda *_args, item=condition_set: self.on_condition_name_changed(item))
+
+        self.condition_sets.append(condition_set)
+        self.condition_notebook.add(tab, text=f"条件{number}")
+        if term_count:
+            self.add_condition_group(condition_set, term_count=term_count, refresh=False)
+        self.refresh_condition_groups(condition_set)
+        self.refresh_condition_set_tabs()
+        self.condition_notebook.select(tab)
+        self.root.after_idle(lambda: canvas.yview_moveto(1.0))
+
+    def delete_condition_set(self) -> None:
+        condition_set = self.current_condition_set()
+        if condition_set is None or len(self.condition_sets) == 1:
+            return
+        index = self.condition_sets.index(condition_set)
+        self.condition_notebook.forget(condition_set["tab"])
+        condition_set["tab"].destroy()
+        self.condition_sets.remove(condition_set)
+        self.refresh_condition_set_tabs()
+        self.condition_notebook.select(max(0, index - 1))
+        self.update_controls()
+
+    def refresh_condition_set_tabs(self) -> None:
+        for condition_set in self.condition_sets:
+            title = self.condition_set_name(condition_set)
+            if len(title) > 18:
+                title = title[:17] + "…"
+            self.condition_notebook.tab(condition_set["tab"], text=title)
+        self.delete_condition_set_button.configure(
+            state="normal" if len(self.condition_sets) > 1 and not self.running else "disabled"
+        )
+
+    def on_condition_name_changed(self, condition_set: dict) -> None:
+        if condition_set in self.condition_sets:
+            self.refresh_condition_set_tabs()
+            self.update_controls()
+
+    def on_condition_tab_changed(self, _event: tk.Event | None = None) -> None:
+        self.refresh_condition_set_tabs()
+
+    def _resize_condition_scroll(self, condition_set: dict) -> None:
+        canvas = condition_set["canvas"]
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _resize_condition_width(self, condition_set: dict, event: tk.Event) -> None:
+        condition_set["canvas"].itemconfigure(condition_set["window"], width=event.width)
+
+    def add_condition_group(
+        self,
+        condition_set: dict | None = None,
+        term_count: int = 1,
+        refresh: bool = True,
+    ) -> None:
+        condition_set = condition_set or self.current_condition_set()
+        if condition_set is None:
+            return
+        frame = ttk.LabelFrame(condition_set["container"], padding=(8, 6))
         frame.pack(fill="x", pady=3)
         header = ttk.Frame(frame)
         header.pack(fill="x")
@@ -580,20 +1007,32 @@ class LogCatchApp:
             "terms_frame": terms_frame,
             "terms": [],
         }
-        delete_button = ttk.Button(header, text="グループを削除", command=lambda: self.delete_condition_group(group))
+        delete_button = ttk.Button(
+            header,
+            text="グループを削除",
+            command=lambda: self.delete_condition_group(condition_set, group),
+        )
         delete_button.pack(side="right")
         group["delete_button"] = delete_button
-        add_button = ttk.Button(header, text="＋ 検索語を追加", command=lambda: self.add_condition_term(group))
+        add_button = ttk.Button(
+            header,
+            text="＋ 検索語を追加",
+            command=lambda: self.add_condition_term(condition_set, group),
+        )
         add_button.pack(side="right", padx=(0, 7))
         group["add_button"] = add_button
-        mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_condition_summary())
-        self.condition_groups.append(group)
+        mode_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.update_condition_summary(condition_set),
+        )
+        condition_set["groups"].append(group)
         for _ in range(term_count):
-            self.add_condition_term(group, refresh=False)
-        self.refresh_condition_groups()
-        self.root.after_idle(lambda: self.condition_canvas.yview_moveto(1.0))
+            self.add_condition_term(condition_set, group, refresh=False)
+        if refresh:
+            self.refresh_condition_groups(condition_set)
+            self.root.after_idle(lambda: condition_set["canvas"].yview_moveto(1.0))
 
-    def add_condition_term(self, group: dict, refresh: bool = True) -> None:
+    def add_condition_term(self, condition_set: dict, group: dict, refresh: bool = True) -> None:
         row = ttk.Frame(group["terms_frame"])
         row.pack(fill="x", pady=2)
         type_variable = tk.StringVar(value=TERM_INCLUDE_LABEL)
@@ -619,40 +1058,45 @@ class LogCatchApp:
             "entry": entry,
             "delete_button": delete_button,
         }
-        delete_button.configure(command=lambda: self.delete_condition_term(group, term))
-        type_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_condition_changed())
-        variable.trace_add("write", lambda *_args: self.on_condition_changed())
+        delete_button.configure(command=lambda: self.delete_condition_term(condition_set, group, term))
+        type_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.on_condition_changed(condition_set),
+        )
+        variable.trace_add("write", lambda *_args: self.on_condition_changed(condition_set))
         group["terms"].append(term)
         if refresh:
-            self.refresh_condition_groups()
+            self.refresh_condition_groups(condition_set)
             entry.focus_set()
 
-    def delete_condition_term(self, group: dict, term: dict) -> None:
+    def delete_condition_term(self, condition_set: dict, group: dict, term: dict) -> None:
         if len(group["terms"]) == 1:
             term["variable"].set("")
             return
         term["row"].destroy()
         group["terms"].remove(term)
-        self.refresh_condition_groups()
+        self.refresh_condition_groups(condition_set)
 
-    def delete_condition_group(self, group: dict) -> None:
-        if len(self.condition_groups) == 1:
+    def delete_condition_group(self, condition_set: dict, group: dict) -> None:
+        if len(condition_set["groups"]) == 1:
             for term in group["terms"]:
                 term["variable"].set("")
             return
         group["frame"].destroy()
-        self.condition_groups.remove(group)
-        self.refresh_condition_groups()
+        condition_set["groups"].remove(group)
+        self.refresh_condition_groups(condition_set)
 
-    def refresh_condition_groups(self) -> None:
-        for index, group in enumerate(self.condition_groups, start=1):
+    def refresh_condition_groups(self, condition_set: dict) -> None:
+        for index, group in enumerate(condition_set["groups"], start=1):
             group["frame"].configure(text=f"条件グループ {index}")
-            group["delete_button"].configure(state="normal" if len(self.condition_groups) > 1 else "disabled")
-        self._resize_condition_scroll()
-        self.on_condition_changed()
+            group["delete_button"].configure(
+                state="normal" if len(condition_set["groups"]) > 1 else "disabled"
+            )
+        self._resize_condition_scroll(condition_set)
+        self.on_condition_changed(condition_set)
 
-    def on_condition_changed(self) -> None:
-        self.update_condition_summary()
+    def on_condition_changed(self, condition_set: dict) -> None:
+        self.update_condition_summary(condition_set)
         self.update_controls()
 
     def paste_condition_term(self, event: tk.Event) -> str | None:
@@ -672,9 +1116,9 @@ class LogCatchApp:
         entry.icursor(insert_at + len(pasted_text))
         return "break"
 
-    def collect_search_groups(self) -> list[SearchGroup]:
+    def collect_search_groups(self, condition_set: dict) -> list[SearchGroup]:
         groups: list[SearchGroup] = []
-        for group in self.condition_groups:
+        for group in condition_set["groups"]:
             terms: list[str] = []
             excluded_terms: list[str] = []
             for term in group["terms"]:
@@ -688,8 +1132,8 @@ class LogCatchApp:
                 groups.append(SearchGroup(terms, mode, excluded_terms))
         return groups
 
-    def update_condition_summary(self) -> None:
-        groups = self.collect_search_groups()
+    def update_condition_summary(self, condition_set: dict) -> None:
+        groups = self.collect_search_groups(condition_set)
         if not groups:
             text = "検索語を1つ以上入力してください"
         elif len(groups) == 1:
@@ -699,9 +1143,13 @@ class LogCatchApp:
             not_text = f"（NOT {not_count}件）" if not_count else ""
             text = f"検索方法: {condition_count}条件を{relation}行{not_text}"
         else:
-            relation = "すべて満たす" if self.overall_mode_var.get() == OVERALL_ALL_LABEL else "いずれかを満たす"
+            relation = (
+                "すべて満たす"
+                if condition_set["overall_mode_var"].get() == OVERALL_ALL_LABEL
+                else "いずれかを満たす"
+            )
             text = f"検索方法: {len(groups)}個の条件グループを{relation}行"
-        self.condition_summary.configure(text=text)
+        condition_set["summary"].configure(text=text)
 
     def choose_files(self) -> None:
         selected = filedialog.askopenfilenames(title="ログファイルを選択", filetypes=(("ログファイル", "*.log"), ("すべてのファイル", "*.*")))
@@ -737,7 +1185,8 @@ class LogCatchApp:
         self.render_files()
 
     def update_controls(self) -> None:
-        ready = bool(self.files and self.collect_search_groups()) and not self.running
+        has_search = any(self.collect_search_groups(item) for item in self.condition_sets)
+        ready = bool(self.files and has_search) and not self.running
         self.start_button.configure(state="normal" if ready else "disabled")
         self.add_button.configure(state="disabled" if self.running else "normal")
         self.clear_button.configure(state="normal" if self.files and not self.running else "disabled")
@@ -746,57 +1195,108 @@ class LogCatchApp:
     def set_condition_controls_enabled(self, enabled: bool) -> None:
         normal_state = "normal" if enabled else "disabled"
         combo_state = "readonly" if enabled else "disabled"
-        self.overall_mode_combo.configure(state=combo_state)
-        self.add_group_button.configure(state=normal_state)
+        self.add_condition_set_button.configure(state=normal_state)
+        self.delete_condition_set_button.configure(
+            state="normal" if enabled and len(self.condition_sets) > 1 else "disabled"
+        )
         self.case_check.configure(state=normal_state)
         self.encoding_combo.configure(state=combo_state)
-        for group in self.condition_groups:
-            group["mode_combo"].configure(state=combo_state)
-            group["add_button"].configure(state=normal_state)
-            can_delete_group = enabled and len(self.condition_groups) > 1
-            group["delete_button"].configure(state="normal" if can_delete_group else "disabled")
-            for term in group["terms"]:
-                term["type_combo"].configure(state=combo_state)
-                term["entry"].configure(state=normal_state)
-                term["delete_button"].configure(state=normal_state)
+        for condition_set in self.condition_sets:
+            condition_set["name_entry"].configure(state=normal_state)
+            condition_set["overall_mode_combo"].configure(state=combo_state)
+            condition_set["add_group_button"].configure(state=normal_state)
+            for group in condition_set["groups"]:
+                group["mode_combo"].configure(state=combo_state)
+                group["add_button"].configure(state=normal_state)
+                can_delete_group = enabled and len(condition_set["groups"]) > 1
+                group["delete_button"].configure(state="normal" if can_delete_group else "disabled")
+                for term in group["terms"]:
+                    term["type_combo"].configure(state=combo_state)
+                    term["entry"].configure(state=normal_state)
+                    term["delete_button"].configure(state=normal_state)
 
     def new_result_path(self) -> Path:
         return create_result_path(application_directory())
 
+    def new_result_paths(self, output_names: list[str]) -> list[Path]:
+        return create_result_paths(application_directory(), output_names)
+
+    def collect_active_searches(self) -> list[tuple[str, SearchOptions]]:
+        searches: list[tuple[str, SearchOptions]] = []
+        for condition_set in self.condition_sets:
+            groups = self.collect_search_groups(condition_set)
+            if not groups:
+                continue
+            group_mode = (
+                "and"
+                if condition_set["overall_mode_var"].get() == OVERALL_ALL_LABEL
+                else "or"
+            )
+            searches.append(
+                (
+                    self.condition_set_name(condition_set),
+                    SearchOptions(
+                        groups,
+                        group_mode,
+                        self.case_var.get(),
+                        self.encoding_var.get(),
+                    ),
+                )
+            )
+        return searches
+
     def start_search(self) -> None:
-        groups = self.collect_search_groups()
-        if not self.files or not groups:
+        searches = self.collect_active_searches()
+        if not self.files or not searches:
             return
         try:
-            self.result_path = self.new_result_path()
+            self.result_names = [name for name, _options in searches]
+            self.result_paths = self.new_result_paths(self.result_names)
         except OSError as error:
             messagebox.showerror("保存先エラー", f"抽出結果ファイルを作成できません。\n\n{error}", parent=self.root)
             return
+        self.result_path = self.result_paths[0]
+        search_rules = [
+            MultiSearchRule(name, options, result_path)
+            for (name, options), result_path in zip(searches, self.result_paths)
+        ]
         self.running = True
         self.started_at = time.monotonic()
         self.elapsed_seconds = 0.0
         self.cancel_event.clear()
+        self.match_counts = [0] * len(search_rules)
         self.match_count = 0
         self.file_error_count = 0
+        self.preview_buffers = [deque(maxlen=PREVIEW_LIMIT) for _rule in search_rules]
+        self.selected_result_index = 0
         self.preview_line_count = 0
         self.preview.configure(state="normal")
         self.preview.delete("1.0", "end")
         self.preview.configure(state="disabled")
         self.count_label.configure(text="0 行")
         self.status_label.configure(text="抽出中")
-        self.current_label.configure(text=f"出力先: {self.result_path}")
+        self.current_label.configure(
+            text=(
+                f"出力先: {self.result_path}"
+                if len(self.result_paths) == 1
+                else f"出力先: {self.result_paths[0].parent}（{len(self.result_paths)}ファイル）"
+            )
+        )
+        self.result_display_names = [
+            f"{index}. {name}" for index, name in enumerate(self.result_names, start=1)
+        ]
+        self.result_selection_combo.configure(values=self.result_display_names, state="readonly")
+        self.result_selection_combo.current(0)
         self.elapsed_label.configure(text="経過 00:00:00")
         self.progress_var.set(0)
         self.cancel_button.configure(state="normal")
         for button in (self.copy_button, self.save_button, self.open_button):
             button.configure(state="disabled")
         self.update_controls()
-        group_mode = "and" if self.overall_mode_var.get() == OVERALL_ALL_LABEL else "or"
-        options = SearchOptions(groups, group_mode, self.case_var.get(), self.encoding_var.get())
         paths = list(self.files)
-        threading.Thread(target=self.run_search, args=(paths, options, self.result_path), daemon=True).start()
+        threading.Thread(target=self.run_search, args=(paths, search_rules), daemon=True).start()
 
-    def run_search(self, paths: list[Path], options: SearchOptions, result_path: Path) -> None:
+    def run_search(self, paths: list[Path], rules: list[MultiSearchRule]) -> None:
         def emit(kind: str, payload: dict) -> None:
             event = (kind, payload)
             if kind in {"preview", "progress"}:
@@ -807,12 +1307,25 @@ class LogCatchApp:
             else:
                 self.events.put(event)
         try:
-            result = extract_logs(paths, options, result_path, self.cancel_event, emit)
+            if len(rules) == 1:
+                single_result = extract_logs(
+                    paths,
+                    rules[0].options,
+                    rules[0].output_path,
+                    self.cancel_event,
+                    emit,
+                )
+                matches = [single_result.matches]
+                file_errors = single_result.file_errors
+            else:
+                multi_result = extract_logs_multi(paths, rules, self.cancel_event, emit)
+                matches = multi_result.matches
+                file_errors = multi_result.file_errors
             emit(
                 "finished",
                 {
-                    "matches": result.matches,
-                    "file_errors": result.file_errors,
+                    "matches": matches,
+                    "file_errors": file_errors,
                     "cancelled": self.cancel_event.is_set(),
                 },
             )
@@ -824,10 +1337,13 @@ class LogCatchApp:
             try:
                 kind, payload = self.events.get_nowait()
                 if kind in {"preview", "marker"}:
-                    self.append_preview(payload["lines"])
+                    rule_index = payload.get("rule", 0)
+                    self.append_preview(rule_index, payload["lines"])
                     if "matches" in payload:
-                        self.match_count = payload["matches"]
-                        self.count_label.configure(text=f"{self.match_count:,} 行")
+                        self.match_counts[rule_index] = payload["matches"]
+                        if rule_index == self.selected_result_index:
+                            self.match_count = payload["matches"]
+                            self.count_label.configure(text=f"{self.match_count:,} 行")
                 elif kind == "file":
                     label = "Shift_JIS" if payload["encoding"] == "cp932" else payload["encoding"].upper()
                     speed = "・高速" if payload.get("fast_path") else ""
@@ -851,8 +1367,11 @@ class LogCatchApp:
             self.elapsed_label.configure(text=f"経過 {format_elapsed(self.elapsed_seconds)}")
         self.root.after(1 if not self.events.empty() else 50, self.poll_events)
 
-    def append_preview(self, lines: list[str]) -> None:
-        if not lines:
+    def append_preview(self, rule_index: int, lines: list[str]) -> None:
+        if not lines or not 0 <= rule_index < len(self.preview_buffers):
+            return
+        self.preview_buffers[rule_index].extend(lines)
+        if rule_index != self.selected_result_index:
             return
         self.preview.configure(state="normal")
         self.preview.insert("end", "\n".join(lines) + "\n")
@@ -864,11 +1383,49 @@ class LogCatchApp:
         self.preview.see("end")
         self.preview.configure(state="disabled")
 
-    def finish_search(self, matches: int, file_errors: int, cancelled: bool) -> None:
+    def render_selected_preview(self) -> None:
+        lines = (
+            list(self.preview_buffers[self.selected_result_index])
+            if 0 <= self.selected_result_index < len(self.preview_buffers)
+            else []
+        )
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        if lines:
+            self.preview.insert("end", "\n".join(lines) + "\n")
+            self.preview.see("end")
+        self.preview.configure(state="disabled")
+        self.preview_line_count = len(lines)
+
+    def on_result_selected(self, _event: tk.Event | None = None) -> None:
+        index = self.result_selection_combo.current()
+        if index < 0 or index >= len(self.result_paths):
+            return
+        self.selected_result_index = index
+        self.result_path = self.result_paths[index]
+        self.match_count = self.match_counts[index] if index < len(self.match_counts) else 0
+        self.count_label.configure(text=f"{self.match_count:,} 行")
+        self.render_selected_preview()
+        if not self.running:
+            self.update_result_action_buttons()
+
+    def selected_result_path(self) -> Path | None:
+        if 0 <= self.selected_result_index < len(self.result_paths):
+            return self.result_paths[self.selected_result_index]
+        return None
+
+    def update_result_action_buttons(self) -> None:
+        path = self.selected_result_path()
+        enabled = bool(path and path.exists() and not self.running)
+        for button in (self.copy_button, self.save_button, self.open_button):
+            button.configure(state="normal" if enabled else "disabled")
+
+    def finish_search(self, matches: list[int], file_errors: int, cancelled: bool) -> None:
         self.freeze_elapsed_time()
         self.running = False
-        self.match_count = matches
-        self.count_label.configure(text=f"{matches:,} 行")
+        self.match_counts = matches
+        self.match_count = matches[self.selected_result_index]
+        self.count_label.configure(text=f"{self.match_count:,} 行")
         if cancelled:
             status = "中止しました"
         elif file_errors:
@@ -877,22 +1434,21 @@ class LogCatchApp:
             status = "完了"
         self.status_label.configure(text=status)
         self.cancel_button.configure(state="disabled")
-        enabled = bool(self.result_path and self.result_path.exists())
-        for button in (self.copy_button, self.save_button, self.open_button):
-            button.configure(state="normal" if enabled else "disabled")
         self.update_controls()
+        self.update_result_action_buttons()
 
     def fail_search(self, message: str) -> None:
         self.freeze_elapsed_time()
         self.running = False
         self.status_label.configure(text="エラー")
-        result_note = f"\n\n途中までの抽出結果は保存されています。\n{self.result_path}" if self.result_path else ""
+        result_note = ""
+        if self.result_paths:
+            saved_paths = "\n".join(str(path) for path in self.result_paths)
+            result_note = f"\n\n途中までの抽出結果は保存されています。\n{saved_paths}"
         self.current_label.configure(text=f"エラー: {message}")
         self.cancel_button.configure(state="disabled")
-        enabled = bool(self.result_path and self.result_path.exists())
-        for button in (self.copy_button, self.save_button, self.open_button):
-            button.configure(state="normal" if enabled else "disabled")
         self.update_controls()
+        self.update_result_action_buttons()
         messagebox.showerror("抽出エラー", message + result_note, parent=self.root)
 
     def cancel_search(self) -> None:
@@ -907,20 +1463,27 @@ class LogCatchApp:
         self.elapsed_label.configure(text=f"所要時間 {format_elapsed(self.elapsed_seconds)}")
 
     def save_result(self) -> None:
-        if not self.result_path:
+        result_path = self.selected_result_path()
+        if not result_path:
             return
-        destination = filedialog.asksaveasfilename(title="抽出結果を保存", defaultextension=".log", filetypes=(("ログファイル", "*.log"),), initialfile="extracted.log")
+        destination = filedialog.asksaveasfilename(
+            title="抽出結果を保存",
+            defaultextension=".log",
+            filetypes=(("ログファイル", "*.log"),),
+            initialfile=result_path.name,
+        )
         if destination:
             try:
-                shutil.copyfile(self.result_path, destination)
+                shutil.copyfile(result_path, destination)
                 self.status_label.configure(text=f"保存しました: {destination}")
             except OSError as error:
                 messagebox.showerror("保存エラー", str(error), parent=self.root)
 
     def copy_all(self) -> None:
-        if not self.result_path or not self.result_path.exists():
+        result_path = self.selected_result_path()
+        if not result_path or not result_path.exists():
             return
-        size = self.result_path.stat().st_size
+        size = result_path.stat().st_size
         if size > COPY_WARNING_BYTES and not messagebox.askyesno(
             "大きな結果をコピー",
             f"結果は{format_bytes(size)}あります。クリップボードへのコピーに時間とメモリを使用します。続行しますか？",
@@ -928,7 +1491,7 @@ class LogCatchApp:
         ):
             return
         try:
-            text = self.result_path.read_text(encoding="utf-8")
+            text = result_path.read_text(encoding="utf-8")
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
             self.root.update()
@@ -937,9 +1500,10 @@ class LogCatchApp:
             messagebox.showerror("コピーエラー", str(error), parent=self.root)
 
     def open_result(self) -> None:
-        if self.result_path and self.result_path.exists():
+        result_path = self.selected_result_path()
+        if result_path and result_path.exists():
             try:
-                os.startfile(self.result_path)
+                os.startfile(result_path)
             except OSError as error:
                 messagebox.showerror("ファイルを開けません", str(error), parent=self.root)
 

@@ -6,12 +6,15 @@ from pathlib import Path
 
 from logcatch import (
     PREVIEW_EVENT_LIMIT,
+    MultiSearchRule,
     SearchGroup,
     SearchOptions,
     build_byte_prefilter,
     create_result_path,
+    create_result_paths,
     detect_encoding,
     extract_logs,
+    extract_logs_multi,
     format_elapsed,
     preserve_nonblank_terms,
     sanitize_search_term,
@@ -43,6 +46,27 @@ class LogCatchTests(unittest.TestCase):
             first.touch()
             second = create_result_path(root, started_at)
             self.assertEqual(second.name, "logcatch_20260826154930_2.log")
+        finally:
+            for path in sorted(root.glob("**/*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            root.rmdir()
+
+    def test_multiple_result_paths_use_safe_unique_output_names(self):
+        root = Path(f".test_results_{uuid.uuid4().hex}")
+        try:
+            started_at = datetime(2026, 10, 27, 15, 30, 0)
+            paths = create_result_paths(root, ["A", "A", "B/C"], started_at)
+            self.assertEqual(
+                [path.name for path in paths],
+                [
+                    "logcatch_20261027153000_A.log",
+                    "logcatch_20261027153000_A_2.log",
+                    "logcatch_20261027153000_B_C.log",
+                ],
+            )
         finally:
             for path in sorted(root.glob("**/*"), reverse=True):
                 if path.is_file():
@@ -116,6 +140,50 @@ class LogCatchTests(unittest.TestCase):
         finally:
             source.unlink(missing_ok=True)
             output.unlink(missing_ok=True)
+
+    def test_single_scan_writes_multiple_condition_outputs(self):
+        token = uuid.uuid4().hex
+        source = Path(f".test_{token}_multi.log")
+        output_a = Path(f".test_{token}_A.log")
+        output_b = Path(f".test_{token}_B.log")
+        events = []
+        try:
+            source.write_bytes("abc one\ndef two\nabc def both\nghi other\n".encode("cp932"))
+            common = {"case_sensitive": False, "encoding": "auto"}
+            rules = [
+                MultiSearchRule(
+                    "A",
+                    SearchOptions([SearchGroup(["abc"], "and")], "and", **common),
+                    output_a,
+                ),
+                MultiSearchRule(
+                    "B",
+                    SearchOptions([SearchGroup(["def"], "and")], "and", **common),
+                    output_b,
+                ),
+            ]
+            extraction = extract_logs_multi(
+                [source],
+                rules,
+                threading.Event(),
+                lambda kind, payload: events.append((kind, payload)),
+            )
+            result_a = output_a.read_text(encoding="utf-8")
+            result_b = output_b.read_text(encoding="utf-8")
+            self.assertEqual(extraction.matches, [2, 2])
+            self.assertEqual(extraction.file_errors, 0)
+            self.assertIn("abc one", result_a)
+            self.assertIn("abc def both", result_a)
+            self.assertNotIn("def two", result_a)
+            self.assertIn("def two", result_b)
+            self.assertIn("abc def both", result_b)
+            self.assertNotIn("abc one", result_b)
+            preview_rules = {payload["rule"] for kind, payload in events if kind == "preview"}
+            self.assertEqual(preview_rules, {0, 1})
+        finally:
+            source.unlink(missing_ok=True)
+            output_a.unlink(missing_ok=True)
+            output_b.unlink(missing_ok=True)
 
     def test_not_condition_excludes_matching_lines_on_fast_path(self):
         token = uuid.uuid4().hex
